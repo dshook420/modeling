@@ -1,0 +1,280 @@
+---
+title: "NBA_Points"
+author: "Dshook"
+date: "6/28/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidymodels)
+library(tidyverse)
+
+
+library(readr)
+NBA <- read_csv("NBA_DATASET.csv")
+
+```
+
+## Distribution of Points Scored
+
+```{r Points}
+NBA %>%
+  ggplot(aes(ptsTeam)) +
+  geom_histogram(bins = 20, fill = "midnightblue", alpha = 0.7) +
+  scale_y_continuous(labels = scales::comma_format()) +
+  labs(
+    y = "Frequency",
+    x = "Number of Points Scored"
+  )
+```
+
+## Home vs Away Points Scored
+
+```{r}
+NBA %>%
+  ggplot(aes(locationGame, ptsTeam, fill = locationGame)) +
+  geom_boxplot(alpha = 0.4, show.legend = FALSE) +
+  labs(x = "Home/Away", y = "Points Scored")
+```
+
+## Change of points scored over years/seasons
+
+```{r message=FALSE, warning=FALSE}
+NBA %>%
+  group_by(yearSeason) %>%
+  summarise(points = mean(ptsTeam, na.rm = TRUE)) %>%
+  ggplot(aes(yearSeason, points)) +
+  geom_line(alpha = 0.6, size = 1.5) +
+  geom_smooth(method = "lm") +
+  scale_y_continuous(limits = c(90, NA)) +
+  labs(x = "Season", y = "Mean Points Scored")
+```
+
+## Handle NA'S in Advanced boxscores
+
+```{r impute missing data}
+
+NBA <- NBA %>% 
+  mutate_if(is.character, factor)
+
+summary(NBA$pctOREB)
+
+summary(NBA$pctDREB)
+
+summary(NBA$pctTREB)
+
+library(recipes)
+
+impute_rec <- recipe(ptsTeam ~ idGame + yearSeason + slugTeam + locationGame + slugOpponent + pctAST + pctOREB + pctDREB + pctTREB + pctTOVE + pctTOVE + pace + ortg + 
+                       drtg + netrtg + possessions + isB2B + isB2BFirst + isB2BSecond , data = NBA) %>%
+  step_knnimpute(all_predictors())
+```
+
+
+```{r}
+imputed <- prep(impute_rec) %>% juice()
+```
+
+## Linear model to explore significance 
+
+```{r}
+fit_lm <- lm(ptsTeam ~ ., data = imputed)
+
+tidy(fit_lm)
+```
+
+
+## Xgboost Prep
+
+```{r}
+NBA_Mod <- imputed %>% 
+  select(yearSeason,idGame, slugTeam, slugOpponent, locationGame, pctOREB, pctDREB, ortg, drtg ,netrtg, pace, isB2B, isB2BFirst, isB2BSecond, ptsTeam ) %>% 
+  select(-c("idGame"))
+
+```
+
+## Data Split
+
+```{r}
+set.seed(123)
+NBA_split <- initial_split(NBA_Mod, strata = ptsTeam)
+NBA_train <- training(NBA_split)
+NBA_test <- testing(NBA_split)
+```
+
+## Boosted Tree Model Specification (regression)
+
+```{r}
+xgb_spec <- boost_tree(
+  trees = 1000, 
+  tree_depth = tune(), min_n = tune(), 
+  loss_reduction = tune(),                     ## first three: model complexity
+  sample_size = tune(), mtry = tune(),         ## randomness
+  learn_rate = tune(),                         ## step size
+) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("regression")
+
+xgb_spec
+
+```
+
+## HYPERPARAMETERS
+
+```{r}
+xgb_grid <- grid_latin_hypercube(
+  tree_depth(),
+  min_n(),
+  loss_reduction(),
+  sample_size = sample_prop(),
+  finalize(mtry(), NBA_train),
+  learn_rate(),
+  size = 30
+)
+
+xgb_grid
+```
+
+## ESTABLISH WORKFLOW
+
+```{r}
+
+xgb_wf <- workflow() %>%
+  add_formula(ptsTeam ~ .) %>%
+  add_model(xgb_spec)
+
+xgb_wf
+
+```
+
+## create cross-validation resamples for tuning our model
+
+```{r}
+
+set.seed(123)
+NBA_folds <- vfold_cv(NBA_train, strata = ptsTeam)
+
+NBA_folds
+
+```
+
+## TIME TO TUNE
+
+```{r}
+doParallel::registerDoParallel()
+
+set.seed(234)
+xgb_res <- tune_grid(
+  xgb_wf,
+  resamples = NBA_folds,
+  grid = xgb_grid,
+  control = control_grid(save_pred = TRUE)
+)
+
+xgb_res
+```
+
+## View Results
+
+```{r}
+xgb_res %>%
+  collect_metrics()
+```
+
+## Visualize Resamples
+
+```{r}
+xgb_res %>%
+  unnest(.predictions) %>%
+  ggplot(aes(ptsTeam, .pred, color = id)) +
+  geom_abline(lty = 2, color = "gray80", size = 1.5) +
+  geom_point(alpha = 0.5) +
+  labs(
+    x = "Actual",
+    y = "Predicted Team Points",
+    color = NULL
+  )
+```
+
+
+
+
+```{r}
+xgb_res %>%
+  collect_metrics() %>%
+  ggplot(aes(learn_rate, mean, color = .metric)) +
+  geom_errorbar(aes(
+    ymin = mean - std_err,
+    ymax = mean + std_err
+  ),
+  alpha = 0.5
+  ) +
+  geom_line(size = 1.5) +
+  facet_wrap(~.metric, scales = "free", nrow = 2) +
+  scale_x_log10() +
+  theme(legend.position = "none")
+```
+
+
+## Select the best
+
+```{r}
+show_best(xgb_res, "rmse")
+
+best_rmse <- select_best(xgb_res, "rmse")
+```
+
+## Finalize Workflow
+
+```{r}
+final_xgb <- finalize_workflow(
+  xgb_wf,
+  best_rmse
+)
+
+final_xgb
+```
+
+## Feature Importance 
+
+```{r message=FALSE, warning=FALSE}
+library(vip)
+
+final_xgb %>%
+  fit(data = NBA_train) %>%
+  pull_workflow_fit() %>%
+  vip(geom = "point")
+```
+
+## Final fit
+
+```{r}
+final_res <- last_fit(final_xgb, NBA_split)
+
+collect_metrics(final_res)
+
+```
+## Visualize final fit
+
+```{r}
+final_res %>%
+  collect_predictions() %>%
+   ggplot(aes(ptsTeam, .pred, color = id)) +
+  geom_abline(lty = 2, color = "midnightblue", size = 1.5) +
+  geom_point(alpha = 0.5) +
+  labs(
+    x = "Actual",
+    y = "Predicted Team Points",
+    color = NULL
+  )
+
+```
+
+```{r}
+NBA_Points_fit <- final_xgb %>%
+  fit(data = NBA_train) %>%
+  pull_workflow_fit() %>%
+  saveRDS(file = "NBA.rds")
+```
+
